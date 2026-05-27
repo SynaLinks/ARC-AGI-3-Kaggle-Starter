@@ -11,14 +11,24 @@ PYTHON          ?= python3.12
 VENV            := .venv
 VENV_PY         := $(VENV)/bin/python
 VENV_PIP        := $(VENV)/bin/pip
-KAGGLE          := KAGGLE_CONFIG_DIR="$(PWD)/.kaggle" $(VENV)/bin/kaggle
+# Read the project-local token at recipe time and expose it as KAGGLE_API_TOKEN
+# (the only env var the modern Kaggle CLI honours for token auth).
+KAGGLE          := KAGGLE_API_TOKEN=$$(cat .kaggle/access_token) $(VENV)/bin/kaggle
 FRAMEWORK_REPO  := https://github.com/arcprize/ARC-AGI-3-Agents.git
 FRAMEWORK_DIR   := vendor/ARC-AGI-3-Agents
 COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status verify-local clean
+.PHONY: help setup play-local pull-sample notebook submit status verify-local clean _check-kaggle
+
+_check-kaggle:
+	@if [ ! -s .kaggle/access_token ]; then \
+	    echo "ERROR: .kaggle/access_token is missing or empty."; \
+	    echo "       Generate a token at https://www.kaggle.com/settings (API → Create New Token)"; \
+	    echo "       and save it as a one-line file at: $(PWD)/.kaggle/access_token"; \
+	    exit 1; \
+	fi
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-15s %s\n",$$1,$$2}' $(MAKEFILE_LIST)
@@ -49,7 +59,7 @@ verify-local: ## Quick smoke test: 50 steps on ls20 + vc33 only
 list-games: ## Show all available games
 	$(VENV_PY) scripts/play_local.py --list
 
-pull-sample: ## Download the official Stochastic Goose sample notebook for reference
+pull-sample: _check-kaggle ## Download the official Stochastic Goose sample notebook for reference
 	mkdir -p reference/stochastic-goose
 	$(KAGGLE) kernels pull inversion/arc3-sample-submission-stochastic-goose \
 	    -p reference/stochastic-goose -m
@@ -58,7 +68,7 @@ pull-sample: ## Download the official Stochastic Goose sample notebook for refer
 notebook: ## Splice agent/my_agent.py into notebooks/submission.ipynb
 	$(VENV_PY) scripts/build_notebook.py
 
-submit: notebook ## Build notebook and push to Kaggle (one-line submission)
+submit: notebook _check-kaggle ## Build notebook and push to Kaggle (one-line submission)
 	@grep -q REPLACE_WITH_YOUR_USERNAME notebooks/kernel-metadata.json && { \
 	    echo "ERROR: edit notebooks/kernel-metadata.json and replace REPLACE_WITH_YOUR_USERNAME"; \
 	    exit 1; } || true
@@ -66,7 +76,7 @@ submit: notebook ## Build notebook and push to Kaggle (one-line submission)
 	@echo ""
 	@echo "Pushed. Track it with:  make status"
 
-status: ## Show the status of your most recent Kaggle kernel run
+status: _check-kaggle ## Show the status of your most recent Kaggle kernel run
 	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('notebooks/kernel-metadata.json'))['id'])"); \
 	$(KAGGLE) kernels status $$KERNEL_ID
 
