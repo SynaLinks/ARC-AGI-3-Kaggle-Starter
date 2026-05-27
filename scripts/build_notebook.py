@@ -69,8 +69,12 @@ def build() -> dict:
         "    arc-agi python-dotenv"
     )
 
+    # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
+    # as a notebook output. Otherwise the "Submit to Competition" UI would
+    # offer it as a candidate submission file alongside submission.parquet,
+    # and an unlucky default selection rejects the submission.
     write_agent_cell = code_cell(
-        "%%writefile /kaggle/working/my_agent.py\n" + agent_body
+        "%%writefile /tmp/my_agent.py\n" + agent_body
     )
 
     run_cell_source = dedent(
@@ -87,7 +91,7 @@ def build() -> dict:
                    /kaggle/working/ARC-AGI-3-Agents
 
             # Drop our agent in as a framework template.
-            !cp /kaggle/working/my_agent.py \\
+            !cp /tmp/my_agent.py \\
                 /kaggle/working/ARC-AGI-3-Agents/agents/templates/my_agent.py
 
             # Register MyAgent in the framework's agent registry. We rewrite
