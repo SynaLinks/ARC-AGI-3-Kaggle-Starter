@@ -53,9 +53,14 @@ make submit
 
 # 7.  Watch the run
 make status
+
+# 8.  When status shows "complete", open the notebook on kaggle.com,
+#     find your kernel, and click "Submit to Competition" in the top
+#     right. That's your one official submission for the day.
 ```
 
-That's the entire loop. Steps 4–7 are what you'll repeat as you iterate.
+That's the entire loop. Steps 4–7 are what you'll repeat as you iterate;
+step 8 is the deliberate moment when you spend your daily submission.
 
 ---
 
