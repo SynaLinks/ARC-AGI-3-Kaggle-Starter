@@ -12,6 +12,9 @@ environment_files/
 recordings/
 logs.log
 
+# Human replay dataset for pretrain.py (downloaded, large — keep the folder)
+dataset/*
+!dataset/.gitkeep
 # Generated artefacts
 notebooks/submission.ipynb
 reference/

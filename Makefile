@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status verify-local clean _check-kaggle
+.PHONY: help setup play-local monitor pretrain pull-sample notebook submit status verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -39,6 +39,17 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install --upgrade pip
 	$(VENV_PIP) install "arc-agi>=0.9.6" "kaggle>=2.2" python-dotenv pandas pyarrow
+	@# World-model stack for agent/my_agent.py (LeWM encoder via stable-worldmodel).
+	@# transformers is PINNED: <5 keeps the pre-refactor ViT state_dict key names
+	@# the lewm-pusht checkpoint was saved with; >=4.46 is needed for TimmWrapperModel
+	@# (which stable-pretraining imports at module load). imageio + opencv are hard
+	@# import deps of stable_worldmodel. torch is already present in the env.
+	$(VENV_PIP) install stable-worldmodel stable-pretraining hydra-core timm \
+	    "transformers>=4.46,<5" imageio opencv-python-headless
+	@# Qt backend for `make monitor` (agent/monitor.py, local dev only):
+	@# uv-managed CPythons ship a _tkinter matplotlib's TkAgg can't load,
+	@# so the monitor falls back to QtAgg, which needs PySide6.
+	$(VENV_PIP) install PySide6
 	@if [ ! -d "$(FRAMEWORK_DIR)/.git" ]; then \
 	    mkdir -p vendor && git clone --depth 1 $(FRAMEWORK_REPO) $(FRAMEWORK_DIR); \
 	else \
@@ -50,8 +61,21 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
 
-play-local: ## Run agent/my_agent.py against ALL games (or GAME=ls20 for a single one)
-	$(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)
+# A/B knobs: COLD=1 disables the pretrained warm start (heads);
+# OBJECTIVE=novelty|displacement|surprise|reward picks the CEM objective.
+COLD_VARS = $(if $(COLD),PRETRAINED_HEADS=$(CURDIR)/.does-not-exist) \
+            $(if $(OBJECTIVE),ARC_OBJECTIVE=$(OBJECTIVE))
+
+play-local: ## Run agent/my_agent.py (GAME=ls20, COLD=1, OBJECTIVE=novelty|displacement|surprise|reward)
+	LEWM_CHECKPOINT=$(CURDIR)/agent/models/lewm-pusht $(COLD_VARS) \
+	    $(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)
+
+monitor: ## play-local with a live arcade monitor window (same knobs as play-local)
+	ARC_MONITOR=1 LEWM_CHECKPOINT=$(CURDIR)/agent/models/lewm-pusht $(COLD_VARS) \
+	    $(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)
+
+pretrain: ## Pretrain world-model heads on the human replay dataset (dataset/)
+	LEWM_CHECKPOINT=$(CURDIR)/agent/models/lewm-pusht $(VENV_PY) pretrain.py $(PRETRAIN_ARGS)
 
 verify-local: ## Quick smoke test: 50 steps on ls20 + vc33 only
 	$(VENV_PY) scripts/play_local.py --game ls20,vc33 --max-steps 50

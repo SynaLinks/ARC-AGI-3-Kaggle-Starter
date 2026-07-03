@@ -164,6 +164,10 @@ already the default in this kit.
 | `make setup` | One-time install: Python venv, `arc-agi`, `kaggle` CLI, clones the framework |
 | `make play-local` | Runs your agent against every game in the dataset, locally |
 | `make play-local GAME=ls20` | Same, but only one game (faster while debugging) |
+| `make play-local STEPS=500` | Raise/lower the per-game action budget (default 200) |
+| `make monitor GAME=ls20` | `play-local` plus a live arcade window: current frame, 3-D PCA sphere of the latent trajectory (drag to rotate), the CEM plan decoded to imagined frames, and the button row with action semantics (↑↓←→ F ◎ ↺) |
+| `make pretrain` | Pretrain the world-model heads (dynamics, surprise, no-op, reward, decoder) on the human replay dataset in `dataset/` **plus** its own random-exploration traces. The result (`agent/models/pretrained_heads.pt`) is auto-loaded by the agent when present |
+| `make pretrain PRETRAIN_ARGS="--games vc33 --epochs 5"` | Pass any `pretrain.py` flags (`--limit`, `--explore-steps`, …) |
 | `make verify-local` | 30-second smoke test on two games |
 | `make list-games` | Print every game id available |
 | `make pull-sample` | Download the official sample agent for reference |
@@ -171,6 +175,28 @@ already the default in this kit.
 | `make submit` | Build the notebook **and** push it to Kaggle |
 | `make status` | Check the status of your most recent Kaggle run |
 | `make clean` | Remove the venv, downloads, and generated notebook |
+
+### A/B knobs (work on both `play-local` and `monitor`)
+
+| Knob | What it does |
+|---|---|
+| `COLD=1` | Ignore the pretrained heads: the from-scratch agent, for comparing against a `make pretrain`-warmed run |
+| `OBJECTIVE=novelty` | CEM objective (default): maximise distance from imagined states to everywhere already visited this game |
+| `OBJECTIVE=displacement` | Maximise predicted latent movement ‖ẑ′ − z‖ (never habituates — kept for comparison) |
+| `OBJECTIVE=surprise` | Maximise the learned expected-prediction-error head, displacement-gated |
+| `OBJECTIVE=reward` | Maximise the pretrained reward head's predicted probability of game progress (level completion / WIN), learned from human replays by `make pretrain` |
+
+Example comparison:
+
+```bash
+make play-local GAME=ls20 STEPS=300                       # warm, novelty
+make play-local GAME=ls20 STEPS=300 COLD=1                # cold, novelty
+make play-local GAME=ls20 STEPS=300 OBJECTIVE=surprise    # warm, surprise
+```
+
+Requires the human replay dataset for `make pretrain`: download the public
+demo dataset (link in the [ARC-AGI-3 human-performance blog post](https://arcprize.org/blog/arc-agi-3-human-dataset))
+and unzip it into `dataset/`.
 
 ---
 
