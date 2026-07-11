@@ -61,12 +61,10 @@ setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
 
-# A/B knobs: COLD=1 disables the pretrained warm start (heads);
-# OBJECTIVE=novelty|displacement|surprise|reward picks the CEM objective.
-COLD_VARS = $(if $(COLD),PRETRAINED_HEADS=$(CURDIR)/.does-not-exist) \
-            $(if $(OBJECTIVE),ARC_OBJECTIVE=$(OBJECTIVE))
+# A/B knob: COLD=1 disables the pretrained warm start (dynamics + decoder).
+COLD_VARS = $(if $(COLD),PRETRAINED_HEADS=$(CURDIR)/.does-not-exist)
 
-play-local: ## Run agent/my_agent.py (GAME=ls20, COLD=1, OBJECTIVE=novelty|displacement|surprise|reward)
+play-local: ## Run agent/my_agent.py (GAME=ls20, COLD=1 to skip the warm start)
 	LEWM_CHECKPOINT=$(CURDIR)/agent/models/lewm-pusht $(COLD_VARS) \
 	    $(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)
 

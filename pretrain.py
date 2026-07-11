@@ -18,12 +18,13 @@ Two data sources → one artefact:
                rarely press dead buttons, so their data is thin on no-ops;
                random play hits walls constantly and fills that gap.
 
-  artefact  `agent/models/pretrained_heads.pt` — dynamics, surprise head,
-            no-op head, reward head and decoder probe trained on all
-            transitions with exactly the online losses (plus the
-            displacement-gate scale τ). Auto-loaded by `WorldModel` at agent
-            startup. The reward head (did this action complete a level / win?)
-            is pretrain-only — its positives come from human replays.
+  artefact  `agent/models/pretrained_heads.pt` — the latent dynamics, the
+            goal head (recent latent history → a k-ahead subgoal latent) and
+            the decoder probe. Auto-loaded by `WorldModel` at agent startup so
+            the goal-directed planner starts with dynamics that know how each
+            action moves the latent and a goal head that proposes where a
+            competent player heads next — including on unseen games, via the
+            in-context history it conditions on.
 
 Usage:
     make pretrain                          # everything, sensible defaults
@@ -57,7 +58,10 @@ import torch.nn.functional as F
 
 from arcengine import GameAction
 
-from agent.my_agent import ARC_PALETTE, NUM_COLORS, WorldModel
+from agent.my_agent import (
+    ARC_PALETTE, GOAL_CONTEXT, GOAL_HORIZON, NUM_COLORS, WorldModel,
+    cell_class_weights,
+)
 
 DATA_DEFAULT = ROOT / "dataset" / "public_games-dataset"
 EXPLORE_DIR = ROOT / "dataset" / ".explore"
@@ -165,13 +169,75 @@ def build_transitions(blob: dict) -> tuple[torch.Tensor, ...]:
     idx = idx[valid]
     z_prev, z_next = blob["z"][idx - 1], blob["z"][idx]
     onehot = F.one_hot(actions[idx] - 1, num_classes=N_ACTIONS).float()
-    noop = (blob["grids"][idx] == blob["grids"][idx - 1]).flatten(1).all(dim=1).float()
-    # Reward label for action_i: it produced game progress — levels_completed
-    # ticked up, or the game entered WIN on this line. Exact but very sparse;
-    # positives come almost entirely from human replays.
-    won = torch.tensor([s == "WIN" for s in blob["states"]], dtype=torch.bool)
-    reward = ((blob["levels"][idx] > blob["levels"][idx - 1]) | won[idx]).float()
-    return z_prev, onehot, z_next, noop, reward
+    return z_prev, onehot, z_next
+
+
+def build_goal_samples(blob: dict, context_len: int, horizon: int) -> tuple[torch.Tensor, ...]:
+    """Per-episode ``(context → k-ahead subgoal)`` samples for the goal head.
+
+    Episodes are the maximal runs of consecutive lines joined by real actions
+    (ACTION1..7); a RESET (id 0) or malformed line (id −1) breaks the run — a
+    goal must never span a reset. For each position ``t`` in an episode with a
+    full ``horizon`` of future left, we emit:
+
+      - ``context``: the ``context_len`` latents ending at ``t`` (edge-padded
+        with the earliest latent early in the episode) — the goal head's input;
+      - ``target``: ``z_{t+horizon}`` — where a competent player actually was
+        ``horizon`` steps later, i.e. the subgoal to learn to propose;
+      - ``weight``: 2.0 if game progress (levels_completed ↑, or WIN) happens in
+        the next ``horizon`` steps, else 1.0 — biases the head toward subgoals
+        that lead to reward without discarding the rest of the trajectory.
+
+    Returns ``(context (n, L, D), target (n, D), weight (n,))`` — empty tensors
+    when the recording is too short to yield any sample.
+    """
+    actions = blob["actions"]
+    z = blob["z"]
+    levels = blob["levels"]
+    states = blob["states"]
+    n = len(actions)
+    latent_dim = z.shape[-1]
+
+    # Reward event per line: level count ticked up vs the previous line, or the
+    # game reached WIN on this line.
+    reward = torch.zeros(n)
+    for i in range(1, n):
+        if levels[i].item() > levels[i - 1].item() or states[i] == "WIN":
+            reward[i] = 1.0
+
+    # Segment into episodes: extend the current run while the action is real,
+    # otherwise close it and start a fresh run at the boundary line.
+    episodes, run = [], [0]
+    for i in range(1, n):
+        if 1 <= actions[i].item() <= N_ACTIONS:
+            run.append(i)
+        else:
+            if len(run) >= 2:
+                episodes.append(run)
+            run = [i]
+    if len(run) >= 2:
+        episodes.append(run)
+
+    contexts, targets, weights = [], [], []
+    for run in episodes:
+        a, b = run[0], run[-1] + 1  # contiguous global index range [a, b)
+        zep = z[a:b]                # (m, D)
+        rep = reward[a:b]           # (m,)
+        m = zep.shape[0]
+        for t in range(m - horizon):
+            lo = max(0, t - context_len + 1)
+            win = zep[lo:t + 1]
+            if win.shape[0] < context_len:  # left-pad with the earliest latent
+                pad = win[:1].expand(context_len - win.shape[0], -1)
+                win = torch.cat([pad, win], dim=0)
+            contexts.append(win)
+            targets.append(zep[t + horizon])
+            weights.append(2.0 if bool(rep[t + 1:t + horizon + 1].any()) else 1.0)
+
+    if not contexts:
+        return (torch.empty(0, context_len, latent_dim),
+                torch.empty(0, latent_dim), torch.empty(0))
+    return torch.stack(contexts), torch.stack(targets), torch.tensor(weights)
 
 
 # ── Random exploration ────────────────────────────────────────────────────────
@@ -260,6 +326,8 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=256, help="training minibatch")
     p.add_argument("--encode-batch", type=int, default=128, help="frames per encoder forward")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--dyn-lr-mult", type=float, default=3.0,
+                   help="LR multiplier for the dynamics (WM predictor) head")
     p.add_argument("--explore-steps", type=int, default=400,
                    help="random-walk actions per exploration episode (0 = no exploration)")
     p.add_argument("--explore-episodes", type=int, default=2, help="exploration episodes per game")
@@ -289,122 +357,128 @@ def main() -> None:
         raise SystemExit(f"LeWM encoder failed to load: {getattr(model, '_encoder_error', '?')}")
 
     # ── Gather traces: human replays + random exploration ───────────────────
-    recordings = [f for g in games for f in sorted((args.data / g).glob("*.recording.jsonl"))]
+    # Each recording is tagged human/explore. Dynamics + decoder learn from
+    # both (exploration adds wall-hit / dead-button coverage humans skip), but
+    # the *goal head* trains on human replays only — it must learn where a
+    # competent player heads next, not where a random walk drifts.
+    recordings = [(f, True) for g in games
+                  for f in sorted((args.data / g).glob("*.recording.jsonl"))]
     if args.explore_steps > 0:
         print(f"exploring: {args.explore_episodes} × {args.explore_steps} random actions per game")
-        recordings += explore_games(games, args.explore_steps, args.explore_episodes)
+        recordings += [(f, False) for f in
+                       explore_games(games, args.explore_steps, args.explore_episodes)]
     if args.limit:
         recordings = recordings[: args.limit]
     print(f"{len(recordings)} recordings across {len(games)} games")
 
-    zp, oh, zn, noop, rew, z_all, grids_all = [], [], [], [], [], [], []
+    torch.manual_seed(0)  # reproducible shuffles across pretraining runs
+    zp, oh, zn, z_all, grids_all = [], [], [], [], []
+    gc, gt, gw = [], [], []  # goal-head samples (human only): context, target, weight
     t0 = time.time()
-    for i, path in enumerate(recordings, 1):
+    for i, (path, is_human) in enumerate(recordings, 1):
         blob = encode_recording(model, path, args.encode_batch)
         if blob is None:
             continue
-        a, b, c, d, e = build_transitions(blob)
-        zp.append(a); oh.append(b); zn.append(c); noop.append(d); rew.append(e)
+        a, b, c = build_transitions(blob)
+        zp.append(a); oh.append(b); zn.append(c)
         z_all.append(blob["z"]); grids_all.append(blob["grids"])
+        n_goal = 0
+        if is_human:
+            c_ctx, c_tgt, c_w = build_goal_samples(blob, GOAL_CONTEXT, GOAL_HORIZON)
+            gc.append(c_ctx); gt.append(c_tgt); gw.append(c_w)
+            n_goal = len(c_ctx)
         print(f"  [{i}/{len(recordings)}] {path.parent.name}/{path.name}: "
-              f"{len(blob['z'])} frames, {len(a)} transitions ({time.time() - t0:.0f}s)")
+              f"{len(blob['z'])} frames, {len(a)} transitions, {n_goal} goal "
+              f"samples ({time.time() - t0:.0f}s)")
 
-    zp, oh, zn, noop, rew = map(torch.cat, (zp, oh, zn, noop, rew))
+    zp, oh, zn = map(torch.cat, (zp, oh, zn))
     z_all, grids_all = torch.cat(z_all), torch.cat(grids_all)
-    print(f"\n{len(zp)} transitions, {len(z_all)} frames, "
-          f"noop share {noop.mean():.1%}, reward share {rew.mean():.2%} "
-          f"({int(rew.sum())} positives), latent dim {model.latent_dim}")
+    gc = torch.cat(gc) if gc else torch.empty(0)
+    if len(gc):
+        gt, gw = torch.cat(gt), torch.cat(gw)
+    train_goal = len(gc) > 0
+    if not train_goal:
+        print("WARNING: no goal samples (recordings shorter than the goal "
+              f"horizon of {GOAL_HORIZON}); goal head will not be trained/saved.")
+    reward_frac = f"{float((gw > 1).float().mean()):.1%} reward-leading" if train_goal else "—"
+    print(f"\n{len(zp)} transitions, {len(z_all)} frames, {len(gc)} goal samples "
+          f"({reward_frac}), latent dim {model.latent_dim}")
 
-    # Reward positives (level completions) are far rarer than no-ops — weight
-    # the positive class by the actual imbalance so BCE doesn't collapse to
-    # "never rewarded". Capped so a near-empty positive set can't blow up.
-    reward_pos_weight = torch.tensor(
-        float(((1.0 - rew.mean()) / rew.mean().clamp_min(1e-6)).clamp(1.0, 500.0)))
-
-    # ── Train the same parts the agent trains online ─────────────────────────
-    heads = [model.dynamics, model.surprise_head, model.noop_head, model.reward_head]
-    if not args.no_decoder:
-        heads.append(model.decoder)
-    optimizer = torch.optim.Adam((q for h in heads for q in h.parameters()), lr=args.lr)
+    # ── Train the parts the agent uses: dynamics, goal head (+ decoder) ──────
+    # The dynamics (the WM predictor) gets a higher LR than the other heads —
+    # it's the part planning quality hinges on, and it must chase a moving
+    # target (its own residual latents), so it benefits from adapting faster.
+    other = ([model.goal_head] if train_goal else []) \
+        + ([model.decoder] if not args.no_decoder else [])
+    groups = [{"params": list(model.dynamics.parameters()), "lr": args.lr * args.dyn_lr_mult},
+              {"params": [p for h in other for p in h.parameters()], "lr": args.lr}]
+    optimizer = torch.optim.Adam([g for g in groups if g["params"]])
+    print(f"dynamics lr {args.lr * args.dyn_lr_mult:g}, other heads lr {args.lr:g}")
 
     for epoch in range(1, args.epochs + 1):
         order = torch.randperm(len(zp))
-        sums, seen, correct = torch.zeros(5), 0, 0
-        noop_hits, noop_total = 0, 0  # recall on the rare positive class
-        rew_hits, rew_total = 0, 0
+        sums, seen = torch.zeros(3), 0
         for start in range(0, len(order), args.batch):
             sel = order[start:start + args.batch]
-            b_zp, b_oh, b_zn, b_noop, b_rew = zp[sel], oh[sel], zn[sel], noop[sel], rew[sel]
+            b_zp, b_oh, b_zn = zp[sel], oh[sel], zn[sel]
 
             predicted = model.predict_next(b_zp, b_oh)
-            dyn_loss = model.realized_surprise(predicted, b_zn).mean()
-            target = model.realized_surprise(predicted.detach(), b_zn)
-            sur_loss = ((model.predicted_surprise(b_zp, b_oh) - target) ** 2).mean()
-            logits = model.noop_logit(b_zp, b_oh)
-            noop_loss = F.binary_cross_entropy_with_logits(
-                logits, b_noop, pos_weight=torch.tensor(WorldModel.NOOP_POS_WEIGHT))
-            rew_logits = model.reward_logit(b_zp, b_oh)
-            rew_loss = F.binary_cross_entropy_with_logits(
-                rew_logits, b_rew, pos_weight=reward_pos_weight)
+            dyn_loss = model.prediction_error(predicted, b_zn).mean()
+
+            goal_loss = torch.tensor(0.0)
+            if train_goal:
+                # Goal samples are indexed independently of transitions (there
+                # are fewer of them near episode ends) — draw a matched batch.
+                gsel = torch.randint(0, len(gc), (len(sel),))
+                pred_goal = model.propose_goal(gc[gsel])
+                per = ((pred_goal - gt[gsel]) ** 2).mean(dim=-1)  # (B,)
+                goal_loss = (gw[gsel] * per).mean()
 
             dec_loss = torch.tensor(0.0)
             if not args.no_decoder:
                 # Decoder pairs are independent of transitions — sample frames.
+                # Class-weighted cross-entropy over cell colours (not RGB MSE):
+                # regression averages small moving objects into the background.
                 fsel = torch.randint(0, len(z_all), (len(sel),))
-                chunk = grids_all[fsel].long().clamp_(0, NUM_COLORS - 1)
-                rgb = ARC_PALETTE[chunk].permute(0, 3, 1, 2)
-                dec_loss = F.mse_loss(model.decode(z_all[fsel]), rgb)
+                target = grids_all[fsel].long().clamp_(0, NUM_COLORS - 1)
+                dec_loss = F.cross_entropy(model.decode_logits(z_all[fsel]), target,
+                                           weight=cell_class_weights(target))
 
-            loss = dyn_loss + sur_loss + noop_loss + rew_loss + dec_loss
+            loss = dyn_loss + goal_loss + dec_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             n = len(sel)
-            sums += n * torch.tensor([dyn_loss.item(), sur_loss.item(),
-                                      noop_loss.item(), rew_loss.item(), dec_loss.item()])
-            correct += ((logits > 0).float() == b_noop).sum().item()
-            noop_hits += ((logits > 0) & (b_noop > 0)).sum().item()
-            noop_total += (b_noop > 0).sum().item()
-            rew_hits += ((rew_logits > 0) & (b_rew > 0)).sum().item()
-            rew_total += (b_rew > 0).sum().item()
+            sums += n * torch.tensor([dyn_loss.item(), goal_loss.item(), dec_loss.item()])
             seen += n
-        d, s, np_, rw, dc = (sums / seen).tolist()
-        recall = noop_hits / max(noop_total, 1)
-        rew_recall = rew_hits / max(rew_total, 1)
-        print(f"epoch {epoch:2}/{args.epochs}  dynamics {d:.4f}  surprise {s:.4f}  "
-              f"noop {np_:.4f} (acc {correct / seen:.1%}, recall {recall:.1%})  "
-              f"reward {rw:.4f} (recall {rew_recall:.1%})  decoder {dc:.4f}")
-
-    # Displacement-gate scale τ: typical realized latent displacement of
-    # frame-changing transitions (get_cost normalizes ‖ẑ′ − z‖ by this).
-    with torch.no_grad():
-        changed = noop < 0.5
-        if changed.any():
-            model.disp_scale.fill_(float((zn[changed] - zp[changed]).norm(dim=-1).mean()))
-    print(f"displacement scale τ = {float(model.disp_scale):.4f}")
+        d, g, dc = (sums / seen).tolist()
+        print(f"epoch {epoch:2}/{args.epochs}  dynamics {d:.4f}  "
+              f"goal {g:.4f}  decoder {dc:.4f}")
 
     # ── Save in the shape WorldModel auto-loads at agent startup ────────────
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    blob = {
         "meta": {
             "latent_dim": model.latent_dim,
             "n_actions": N_ACTIONS,
             "lewm_checkpoint": os.environ["LEWM_CHECKPOINT"],
             "transitions": len(zp),
-            "reward_positives": int(rew.sum()),
             "frames": len(z_all),
+            "goal_samples": len(gc),
+            "goal_context": GOAL_CONTEXT,
+            "goal_horizon": GOAL_HORIZON,
             "epochs": args.epochs,
             "games": games,
         },
         "dynamics": model.dynamics.state_dict(),
-        "surprise_head": model.surprise_head.state_dict(),
-        "noop_head": model.noop_head.state_dict(),
-        "reward_head": model.reward_head.state_dict(),
         "decoder": model.decoder.state_dict(),
-        "disp_scale": float(model.disp_scale),
-    }, args.out)
-    print(f"\nsaved pretrained heads → {args.out}")
+    }
+    if train_goal:
+        blob["goal_head"] = model.goal_head.state_dict()
+    torch.save(blob, args.out)
+    print(f"\nsaved pretrained dynamics{' + goal head' if train_goal else ''} "
+          f"+ decoder → {args.out}")
 
 
 if __name__ == "__main__":

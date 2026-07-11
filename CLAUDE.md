@@ -1,0 +1,1 @@
+If the user tells you to start the autoresearch loop, start by reading @AUTORESEARCH.md
